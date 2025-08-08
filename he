@@ -1,0 +1,805 @@
+#!/bin/bash
+
+export LANG=en_US.UTF-8
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+PURPLE="\033[35m"
+CYAN="\033[36m"
+PLAIN="\033[0m"
+
+red() { echo -e "${RED}$1${PLAIN}"; }
+green() { echo -e "${GREEN}$1${PLAIN}"; }
+yellow() { echo -e "${YELLOW}$1${PLAIN}"; }
+blue() { echo -e "${BLUE}$1${PLAIN}"; }
+purple() { echo -e "${PURPLE}$1${PLAIN}"; }
+cyan() { echo -e "${CYAN}$1${PLAIN}"; }
+
+# 配置目录
+WG_DIR="/etc/wireguard"
+CLIENT_DIR="/root/wireguard-clients"
+LOG_DIR="/var/log/wireguard"
+NGINX_CONF_DIR="/etc/nginx"
+
+# 网络配置
+VPN_NET="10.66.66.0/24"
+VPN_INTERFACE="wg0"
+
+[[ $EUID -ne 0 ]] && red "[!] 请使用 root 用户运行本脚本！" && exit 1
+
+# 显示抗封锁选项菜单
+show_stealth_menu() {
+    clear
+    cyan "========================================"
+    cyan "    WireGuard 抗封锁配置选择"
+    cyan "========================================"
+    echo ""
+    yellow "请选择抗封锁方案："
+    echo ""
+    echo "1) UDP over TCP 隧道 (udp2raw)"
+    echo "2) WebSocket 隧道 (wstunnel)" 
+    echo "3) HTTPS 伪装 (nginx + 证书)"
+    echo "4) 端口跳跃 + 混淆"
+    echo "5) Shadowsocks 前置代理"
+    echo "6) 混合隐身模式 (推荐)"
+    echo ""
+    read -rp "请选择 [1-6, 默认6]: " STEALTH_MODE
+    STEALTH_MODE=${STEALTH_MODE:-6}
+    
+    case $STEALTH_MODE in
+        1) setup_udp2raw ;;
+        2) setup_wstunnel ;;
+        3) setup_https_camouflage ;;
+        4) setup_port_hopping ;;
+        5) setup_shadowsocks_proxy ;;
+        6) setup_hybrid_stealth ;;
+        *) yellow "[*] 使用默认混合隐身模式"; setup_hybrid_stealth ;;
+    esac
+}
+
+# 检测系统
+detect_system() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        SYSTEM="$ID"
+        VERSION="$VERSION_ID"
+    else
+        red "[!] 无法检测系统类型"
+        exit 1
+    fi
+
+    case $SYSTEM in
+        "ubuntu"|"debian")
+            PKG_MANAGER="apt"
+            PKG_INSTALL="apt install -y"
+            PKG_UPDATE="apt update -y && apt upgrade -y"
+            ;;
+        "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
+            PKG_MANAGER="yum"
+            PKG_INSTALL="yum install -y"
+            PKG_UPDATE="yum update -y"
+            if [[ $SYSTEM == "centos" ]]; then
+                PKG_INSTALL="yum install -y epel-release && yum install -y"
+            fi
+            ;;
+        *)
+            red "[!] 不支持的系统: $SYSTEM"
+            exit 1
+            ;;
+    esac
+
+    yellow "[*] 检测到系统: $SYSTEM $VERSION"
+}
+
+# 安装依赖和混淆工具
+install_dependencies() {
+    yellow "[*] 安装依赖包和隐身工具..."
+    
+    $PKG_UPDATE
+    
+    # 基础工具
+    case $SYSTEM in
+        "ubuntu"|"debian")
+            $PKG_INSTALL wireguard wireguard-tools linux-headers-$(uname -r) \
+                         curl wget unzip qrencode nginx certbot python3-certbot-nginx \
+                         ufw fail2ban jq bc net-tools dnsutils openssl socat cron \
+                         build-essential git cmake libssl-dev nodejs npm iptables-persistent \
+                         obfs4proxy shadowsocks-libev simple-obfs python3-pip
+            ;;
+        "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
+            $PKG_INSTALL wireguard-tools kernel-devel-$(uname -r) \
+                         curl wget unzip qrencode nginx certbot python3-certbot-nginx \
+                         firewalld fail2ban jq bc net-tools bind-utils openssl socat \
+                         gcc git cmake openssl-devel nodejs npm iptables-services \
+                         python3-pip
+            ;;
+    esac
+    
+    # 安装额外混淆工具
+    pip3 install shadowsocks wstunnel
+    
+    # 安装 udp2raw (UDP over TCP 工具)
+    install_udp2raw
+    
+    # 配置 fail2ban
+    setup_fail2ban_protection
+}
+
+# 安装 udp2raw
+install_udp2raw() {
+    yellow "[*] 安装 udp2raw..."
+    
+    cd /tmp || exit 1
+    
+    # 检测架构
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) ARCH_NAME="amd64" ;;
+        aarch64) ARCH_NAME="arm64" ;;
+        armv7l) ARCH_NAME="arm" ;;
+        *) red "[!] 不支持的架构: $ARCH"; return 1 ;;
+    esac
+    
+    # 下载 udp2raw
+    wget -O udp2raw "https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"
+    tar -xzf udp2raw_binaries.tar.gz
+    
+    # 查找对应架构的二进制文件
+    UDP2RAW_BIN=$(find . -name "*${ARCH_NAME}*" -type f | head -1)
+    if [[ -n "$UDP2RAW_BIN" ]]; then
+        chmod +x "$UDP2RAW_BIN"
+        mv "$UDP2RAW_BIN" /usr/local/bin/udp2raw
+        green "[*] udp2raw 安装成功"
+    else
+        yellow "[!] udp2raw 安装失败，跳过该功能"
+    fi
+    
+    rm -rf /tmp/udp2raw*
+}
+
+# 配置 fail2ban 防护
+setup_fail2ban_protection() {
+    if ! systemctl is-active --quiet fail2ban; then
+        systemctl enable --now fail2ban
+        
+        # WireGuard 防护规则
+        cat > /etc/fail2ban/filter.d/wireguard.conf <<EOF
+[Definition]
+failregex = .*Invalid handshake initiation from <HOST>.*
+            .*Handshake did not complete after .* seconds, retrying.*
+            .*Receiving handshake initiation from unknown peer <HOST>.*
+ignoreregex =
+EOF
+
+        cat > /etc/fail2ban/jail.d/wireguard.conf <<EOF
+[wireguard]
+enabled = true
+port = 51820,443,80,8080
+filter = wireguard
+logpath = $LOG_DIR/wireguard.log
+maxretry = 5
+bantime = 3600
+findtime = 600
+EOF
+        
+        systemctl restart fail2ban
+    fi
+}
+
+# 获取服务器 IP
+get_server_ip() {
+    yellow "[*] 获取服务器公网 IP..."
+    
+    IP_SOURCES=(
+        "https://api.ipify.org"
+        "https://icanhazip.com"
+        "https://ipv4.icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ifconfig.me/ip"
+    )
+    
+    for source in "${IP_SOURCES[@]}"; do
+        SERVER_IP=$(curl -s --connect-timeout 5 --max-time 10 "$source" 2>/dev/null | grep -E '^[0-9.]+$')
+        [[ -n "$SERVER_IP" ]] && break
+    done
+    
+    if [[ -z "$SERVER_IP" ]]; then
+        red "[!] 无法获取服务器公网 IP"
+        exit 1
+    fi
+    
+    yellow "[*] 服务器 IP: $SERVER_IP"
+}
+
+# 方案1: UDP over TCP 隧道
+setup_udp2raw() {
+    yellow "[*] 配置 UDP over TCP 隧道..."
+    
+    WG_PORT=51820
+    TCP_PORT=443
+    RAW_PASSWORD=$(openssl rand -base64 16)
+    
+    STEALTH_CONFIG="udp2raw"
+    
+    yellow "[*] WireGuard 端口: $WG_PORT"
+    yellow "[*] TCP 伪装端口: $TCP_PORT"
+    yellow "[*] 隧道密码: $RAW_PASSWORD"
+    
+    # 保存配置
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=udp2raw
+WG_PORT=$WG_PORT
+TCP_PORT=$TCP_PORT
+RAW_PASSWORD=$RAW_PASSWORD
+EOF
+}
+
+# 方案2: WebSocket 隧道
+setup_wstunnel() {
+    yellow "[*] 配置 WebSocket 隧道..."
+    
+    WG_PORT=51820
+    WS_PORT=8080
+    HTTPS_PORT=443
+    
+    STEALTH_CONFIG="wstunnel"
+    
+    yellow "[*] WireGuard 端口: $WG_PORT"
+    yellow "[*] WebSocket 端口: $WS_PORT"
+    yellow "[*] HTTPS 端口: $HTTPS_PORT"
+    
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=wstunnel
+WG_PORT=$WG_PORT
+WS_PORT=$WS_PORT
+HTTPS_PORT=$HTTPS_PORT
+EOF
+}
+
+# 方案3: HTTPS 伪装
+setup_https_camouflage() {
+    yellow "[*] 配置 HTTPS 伪装..."
+    
+    read -rp "请输入你的域名 (可选): " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        # 生成假域名
+        FAKE_DOMAINS=(
+            "wg-$(openssl rand -hex 4).example.com"
+            "vpn-$(openssl rand -hex 4).cloudflare.com"
+            "secure-$(openssl rand -hex 4).github.io"
+        )
+        DOMAIN=${FAKE_DOMAINS[$((RANDOM % ${#FAKE_DOMAINS[@]}))]}
+        USE_REAL_DOMAIN=false
+        yellow "[*] 生成伪装域名: $DOMAIN"
+    else
+        USE_REAL_DOMAIN=true
+    fi
+    
+    WG_PORT=51820
+    HTTPS_PORT=443
+    
+    STEALTH_CONFIG="https"
+    
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=https
+WG_PORT=$WG_PORT
+HTTPS_PORT=$HTTPS_PORT
+DOMAIN=$DOMAIN
+USE_REAL_DOMAIN=$USE_REAL_DOMAIN
+EOF
+}
+
+# 方案4: 端口跳跃
+setup_port_hopping() {
+    yellow "[*] 配置端口跳跃..."
+    
+    # 生成随机端口池
+    PORTS=($(shuf -i 10000-65000 -n 8 | sort -n))
+    PRIMARY_PORT=${PORTS[0]}
+    WG_PORT=$PRIMARY_PORT
+    
+    STEALTH_CONFIG="port_hop"
+    
+    yellow "[*] 端口池: ${PORTS[*]}"
+    
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=port_hop
+PORTS=(${PORTS[*]})
+WG_PORT=$WG_PORT
+EOF
+}
+
+# 方案5: Shadowsocks 前置代理
+setup_shadowsocks_proxy() {
+    yellow "[*] 配置 Shadowsocks 前置代理..."
+    
+    WG_PORT=51820
+    SS_PORT=8388
+    SS_PASSWORD=$(openssl rand -base64 16)
+    SS_METHOD="chacha20-ietf-poly1305"
+    
+    STEALTH_CONFIG="shadowsocks"
+    
+    yellow "[*] Shadowsocks 端口: $SS_PORT"
+    yellow "[*] 加密方法: $SS_METHOD"
+    
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=shadowsocks
+WG_PORT=$WG_PORT
+SS_PORT=$SS_PORT
+SS_PASSWORD=$SS_PASSWORD
+SS_METHOD=$SS_METHOD
+EOF
+}
+
+# 方案6: 混合隐身模式
+setup_hybrid_stealth() {
+    yellow "[*] 配置混合隐身模式..."
+    
+    # 组合多种技术
+    WG_PORT=51820
+    TCP_PORT=443
+    WS_PORT=8080
+    SS_PORT=8388
+    
+    RAW_PASSWORD=$(openssl rand -base64 16)
+    SS_PASSWORD=$(openssl rand -base64 16)
+    SS_METHOD="chacha20-ietf-poly1305"
+    
+    # 随机端口池
+    PORTS=($(shuf -i 20000-60000 -n 5))
+    
+    STEALTH_CONFIG="hybrid"
+    
+    yellow "[*] 混合模式已激活"
+    yellow "[*] TCP 伪装: $TCP_PORT"
+    yellow "[*] WebSocket: $WS_PORT"  
+    yellow "[*] Shadowsocks: $SS_PORT"
+    yellow "[*] 端口池: ${PORTS[*]}"
+    
+    cat > "$WG_DIR/stealth.conf" <<EOF
+STEALTH_MODE=hybrid
+WG_PORT=$WG_PORT
+TCP_PORT=$TCP_PORT
+WS_PORT=$WS_PORT
+SS_PORT=$SS_PORT
+RAW_PASSWORD=$RAW_PASSWORD
+SS_PASSWORD=$SS_PASSWORD
+SS_METHOD=$SS_METHOD
+PORTS=(${PORTS[*]})
+EOF
+}
+
+# 生成 WireGuard 密钥
+generate_keys() {
+    yellow "[*] 生成 WireGuard 密钥..."
+    
+    mkdir -p "$WG_DIR" "$CLIENT_DIR" "$LOG_DIR"
+    
+    # 生成服务器密钥对
+    SERVER_PRIVATE_KEY=$(wg genkey)
+    SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
+    
+    # 生成预共享密钥 (增强安全性)
+    PRESHARED_KEY=$(wg genpsk)
+    
+    yellow "[*] 服务器公钥: $SERVER_PUBLIC_KEY"
+    
+    # 保存密钥
+    cat > "$WG_DIR/keys.txt" <<EOF
+Server Private Key: $SERVER_PRIVATE_KEY
+Server Public Key: $SERVER_PUBLIC_KEY
+Preshared Key: $PRESHARED_KEY
+Generated: $(date)
+EOF
+    chmod 600 "$WG_DIR/keys.txt"
+}
+
+# 配置 WireGuard 服务器
+configure_wireguard_server() {
+    yellow "[*] 配置 WireGuard 服务器..."
+    
+    # 加载隐身配置
+    source "$WG_DIR/stealth.conf"
+    
+    # 生成服务器配置
+    cat > "$WG_DIR/$VPN_INTERFACE.conf" <<EOF
+[Interface]
+PrivateKey = $SERVER_PRIVATE_KEY
+Address = ${VPN_NET%.*}.1/24
+ListenPort = $WG_PORT
+SaveConfig = false
+
+# 网络优化
+MTU = 1420
+PreUp = echo 'WireGuard Starting' >> $LOG_DIR/wireguard.log
+PostUp = iptables -A FORWARD -i $VPN_INTERFACE -j ACCEPT; iptables -A FORWARD -o $VPN_INTERFACE -j ACCEPT; iptables -t nat -A POSTROUTING -o \$(ip route | grep default | awk '{print \$5}' | head -n1) -j MASQUERADE
+PostUp = echo 'WireGuard Started' >> $LOG_DIR/wireguard.log
+PreDown = iptables -D FORWARD -i $VPN_INTERFACE -j ACCEPT; iptables -D FORWARD -o $VPN_INTERFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o \$(ip route | grep default | awk '{print \$5}' | head -n1) -j MASQUERADE
+PostDown = echo 'WireGuard Stopped' >> $LOG_DIR/wireguard.log
+
+# 日志记录
+#LogLevel = verbose
+
+EOF
+
+    chmod 600 "$WG_DIR/$VPN_INTERFACE.conf"
+    
+    # 启用 IP 转发
+    echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+    echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
+    sysctl -p
+}
+
+# 部署隐身层
+deploy_stealth_layer() {
+    yellow "[*] 部署隐身层..."
+    
+    source "$WG_DIR/stealth.conf"
+    
+    case $STEALTH_MODE in
+        "udp2raw")
+            deploy_udp2raw_tunnel
+            ;;
+        "wstunnel")
+            deploy_wstunnel
+            ;;
+        "https")
+            deploy_https_camouflage
+            ;;
+        "port_hop")
+            deploy_port_hopping
+            ;;
+        "shadowsocks")
+            deploy_shadowsocks
+            ;;
+        "hybrid")
+            deploy_all_stealth_methods
+            ;;
+    esac
+}
+
+# 部署 UDP2RAW 隧道
+deploy_udp2raw_tunnel() {
+    if [[ -f /usr/local/bin/udp2raw ]]; then
+        # 创建 UDP2RAW 服务
+        cat > /etc/systemd/system/udp2raw.service <<EOF
+[Unit]
+Description=UDP2RAW Tunnel
+After=network.target
+Wants=wireguard-wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/udp2raw -s -l0.0.0.0:$TCP_PORT -r127.0.0.1:$WG_PORT -k "$RAW_PASSWORD" --raw-mode faketcp -a
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        systemctl daemon-reload
+        systemctl enable udp2raw
+    fi
+}
+
+# 部署 WebSocket 隧道
+deploy_wstunnel() {
+    # 安装 wstunnel
+    npm install -g wstunnel
+    
+    # 创建 wstunnel 服务
+    cat > /etc/systemd/system/wstunnel.service <<EOF
+[Unit]
+Description=WebSocket Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node $(npm root -g)/wstunnel/bin/wstunnel -s $WS_PORT --udp-forward=127.0.0.1:$WG_PORT
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable wstunnel
+}
+
+# 部署 HTTPS 伪装
+deploy_https_camouflage() {
+    if [[ "$USE_REAL_DOMAIN" == "true" ]]; then
+        # 申请真实证书
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@$DOMAIN"
+    else
+        # 生成自签名证书
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout "/etc/ssl/private/$DOMAIN.key" \
+                -out "/etc/ssl/certs/$DOMAIN.crt" \
+                -subj "/C=US/ST=CA/L=San Francisco/O=Tech Corp/CN=$DOMAIN"
+    fi
+    
+    # 配置 Nginx
+    cat > "/etc/nginx/sites-available/wireguard-stealth" <<EOF
+upstream wireguard {
+    server 127.0.0.1:$WG_PORT;
+}
+
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen $HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    
+    ssl_certificate ${USE_REAL_DOMAIN:+/etc/letsencrypt/live/$DOMAIN/fullchain.pem};
+    ssl_certificate_key ${USE_REAL_DOMAIN:+/etc/letsencrypt/live/$DOMAIN/privkey.pem};
+    ${USE_REAL_DOMAIN:+ssl_certificate /etc/ssl/certs/$DOMAIN.crt;}
+    ${USE_REAL_DOMAIN:+ssl_certificate_key /etc/ssl/private/$DOMAIN.key;}
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    
+    # 伪装成正常网站
+    location / {
+        proxy_pass https://www.cloudflare.com;
+        proxy_set_header Host www.cloudflare.com;
+        proxy_ssl_server_name on;
+    }
+    
+    # WireGuard UDP over HTTP 隧道
+    location /wg-tunnel {
+        proxy_pass http://127.0.0.1:$WG_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+    
+    ln -sf /etc/nginx/sites-available/wireguard-stealth /etc/nginx/sites-enabled/
+    nginx -t && systemctl reload nginx
+}
+
+# 部署端口跳跃
+deploy_port_hopping() {
+    # 创建端口跳跃脚本
+    cat > /usr/local/bin/wg-port-hop.sh <<EOF
+#!/bin/bash
+
+PORTS=(${PORTS[*]})
+WG_INTERFACE="$VPN_INTERFACE"
+CURRENT_PORT=\$(wg show \$WG_INTERFACE listen-port 2>/dev/null)
+
+# 选择新端口
+for port in "\${PORTS[@]}"; do
+    if [[ "\$port" != "\$CURRENT_PORT" ]]; then
+        # 停止服务
+        wg-quick down \$WG_INTERFACE 2>/dev/null
+        
+        # 更新端口
+        sed -i "s/ListenPort = .*/ListenPort = \$port/" /etc/wireguard/\$WG_INTERFACE.conf
+        
+        # 重启服务
+        wg-quick up \$WG_INTERFACE
+        
+        # 更新防火墙
+        ufw delete allow \$CURRENT_PORT/udp 2>/dev/null
+        ufw allow \$port/udp
+        
+        echo "\$(date): WireGuard port hopped to \$port" >> $LOG_DIR/port-hop.log
+        break
+    fi
+done
+EOF
+    
+    chmod +x /usr/local/bin/wg-port-hop.sh
+    
+    # 添加定时端口跳跃 (每2小时)
+    (crontab -l 2>/dev/null; echo "0 */2 * * * /usr/local/bin/wg-port-hop.sh") | crontab -
+}
+
+# 部署 Shadowsocks
+deploy_shadowsocks() {
+    # 配置 Shadowsocks 服务器
+    cat > /etc/shadowsocks-libev/config.json <<EOF
+{
+    "server": "0.0.0.0",
+    "server_port": $SS_PORT,
+    "password": "$SS_PASSWORD",
+    "timeout": 300,
+    "method": "$SS_METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "plugin": "obfs-server",
+    "plugin_opts": "obfs=tls;failover=127.0.0.1:$WG_PORT"
+}
+EOF
+
+    systemctl enable --now shadowsocks-libev
+}
+
+# 部署所有隐身方法 (混合模式)
+deploy_all_stealth_methods() {
+    yellow "[*] 部署混合隐身层..."
+    
+    # 部署所有方法
+    deploy_udp2raw_tunnel
+    deploy_wstunnel  
+    deploy_shadowsocks
+    deploy_port_hopping
+    
+    # 创建智能路由
+    create_intelligent_routing
+}
+
+# 创建智能路由
+create_intelligent_routing() {
+    cat > /usr/local/bin/wg-smart-route.sh <<'EOF'
+#!/bin/bash
+
+# 根据网络状况自动选择最佳隧道
+check_tunnel_health() {
+    local tunnel=$1
+    local port=$2
+    
+    # 简单连通性检查
+    timeout 5 nc -u -z 127.0.0.1 $port 2>/dev/null
+    return $?
+}
+
+# 检查所有隧道健康状况
+if check_tunnel_health "wireguard" "$WG_PORT"; then
+    echo "$(date): Direct WireGuard OK" >> /var/log/wireguard/routing.log
+elif check_tunnel_health "udp2raw" "$TCP_PORT"; then
+    echo "$(date): Using UDP2RAW tunnel" >> /var/log/wireguard/routing.log
+elif check_tunnel_health "shadowsocks" "$SS_PORT"; then
+    echo "$(date): Using Shadowsocks tunnel" >> /var/log/wireguard/routing.log  
+else
+    echo "$(date): All tunnels down, attempting recovery" >> /var/log/wireguard/routing.log
+    systemctl restart wg-quick@wg0
+fi
+EOF
+    
+    chmod +x /usr/local/bin/wg-smart-route.sh
+    
+    # 每5分钟检查一次
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/wg-smart-route.sh") | crontab -
+}
+
+# 配置防火墙
+configure_firewall() {
+    yellow "[*] 配置防火墙..."
+    
+    source "$WG_DIR/stealth.conf"
+    
+    # UFW 配置
+    if command -v ufw &> /dev/null; then
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow ssh
+        
+        # 根据隐身模式开放端口
+        case $STEALTH_MODE in
+            "udp2raw"|"hybrid")
+                ufw allow $TCP_PORT comment 'UDP2RAW TCP'
+                ;;
+            "wstunnel"|"hybrid")
+                ufw allow $WS_PORT comment 'WebSocket'
+                ufw allow $HTTPS_PORT comment 'HTTPS'
+                ;;
+            "https")
+                ufw allow 80 comment 'HTTP'
+                ufw allow $HTTPS_PORT comment 'HTTPS'
+                ;;
+            "port_hop"|"hybrid")
+                for port in "${PORTS[@]}"; do
+                    ufw allow $port/udp comment "WG-Hop-$port"
+                done
+                ;;
+            "shadowsocks"|"hybrid")
+                ufw allow $SS_PORT comment 'Shadowsocks'
+                ;;
+            *)
+                ufw allow $WG_PORT/udp comment 'WireGuard'
+                ;;
+        esac
+        
+        ufw --force enable
+    fi
+    
+    # iptables 基础规则
+    iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT
+    iptables -I FORWARD -i $VPN_INTERFACE -j ACCEPT
+    iptables -I FORWARD -o $VPN_INTERFACE -j ACCEPT
+    iptables -I INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+}
+
+# 启动 WireGuard 服务
+start_wireguard_service() {
+    yellow "[*] 启动 WireGuard 服务..."
+    
+    # 启用 WireGuard 内核模块
+    modprobe wireguard
+    
+    # 启动服务
+    wg-quick up $VPN_INTERFACE
+    
+    # 设置开机自启
+    systemctl enable wg-quick@$VPN_INTERFACE
+    
+    # 启动隐身层服务
+    source "$WG_DIR/stealth.conf"
+    case $STEALTH_MODE in
+        "udp2raw"|"hybrid")
+            systemctl start udp2raw
+            ;;
+        "wstunnel"|"hybrid")  
+            systemctl start wstunnel
+            ;;
+        "shadowsocks"|"hybrid")
+            systemctl start shadowsocks-libev
+            ;;
+    esac
+    
+    # 验证服务状态
+    if wg show $VPN_INTERFACE &>/dev/null; then
+        green "[*] WireGuard 服务启动成功"
+    else
+        red "[!] WireGuard 服务启动失败"
+        exit 1
+    fi
+}
+
+# 生成客户端配置
+generate_client_config() {
+    local client_name="${1:-client-$(date +%s)}"
+    
+    yellow "[*] 生成客户端配置: $client_name"
+    
+    # 生成客户端密钥对
+    CLIENT_PRIVATE_KEY=$(wg genkey)
+    CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVATE_KEY" | wg pubkey)
+    
+    # 分配客户端 IP
+    CLIENT_COUNT=$(grep -c "PublicKey" "$WG_DIR/$VPN_INTERFACE.conf" 2>/dev/null || echo "0")
+    CLIENT_IP="${VPN_NET%.*}.$((CLIENT_COUNT + 2))/32"
+    
+    source "$WG_DIR/stealth.conf"
+    
+    # 添加客户端到服务器配置
+    cat >> "$WG_DIR/$VPN_INTERFACE.conf" <<EOF
+
+# Client: $client_name
+[Peer]
+PublicKey = $CLIENT_PUBLIC_KEY
+PresharedKey = $PRESHARED_KEY
+AllowedIPs = ${CLIENT_IP%/*}/32
+EOF
+
+    # 重载 WireGuard 配置
+    wg syncconf $VPN_INTERFACE <(wg-quick strip $VPN_INTERFACE)
+    
+    # 根据隐身模式生成不同的客户端配置
+    case $STEALTH_MODE in
+        "udp2raw"|"hybrid")
+            generate_udp2raw_client_config "$client_name"
+            ;;
+        "wstunnel"|"hybrid")
+            generate_wstunnel_client_config "$client_name"
+            ;;
+        "https")
+            generate_https_client_config "$client_name"
+            ;;
+        "port_hop"|"hybrid")
+            generate_port_hop_client_config "$client_name"
+            ;;
+        "shadowsocks
