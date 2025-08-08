@@ -97,7 +97,7 @@ detect_system() {
 install_dependencies() {
     yellow "[*] 安装依赖包和隐身工具..."
     
-    $PKG_UPDATE
+    #   $PKG_UPDATE
     
     # 基础工具
     case $SYSTEM in
