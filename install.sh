@@ -613,7 +613,12 @@ generate_client_config() {
     
     # 分配客户端 IP
     CLIENT_COUNT=$(grep -c "PublicKey" "$WG_DIR/$VPN_INTERFACE.conf" 2>/dev/null || echo "0")
-    CLIENT_IP="${VPN_NET%.*}.$((CLIENT_COUNT + 2))/32"
+    CLIENT_COUNT=$(grep -c "PublicKey" "$WG_DIR/$VPN_INTERFACE.conf" 2>/dev/null)
+if [[ -z "$CLIENT_COUNT" ]] || [[ "$CLIENT_COUNT" == "0" ]]; then
+    CLIENT_COUNT=0
+fi
+CLIENT_NUM=$((CLIENT_COUNT + 2))
+CLIENT_IP="10.66.66.$CLIENT_NUM/32"
     
     # 添加到服务器配置
     cat >> "$WG_DIR/$VPN_INTERFACE.conf" <<EOF
